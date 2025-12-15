@@ -1,16 +1,24 @@
-import os           #.env에서 읽어온 환경변수를 os.getenv()로 꺼낼 때 사용
-from typing import Optional, List
-from datetime import date   # FastAPI 파라미터/응답 모델에서 날짜·시각 타입을 명확히 할 때 사용
-from dotenv import load_dotenv  #.env 파일을 읽어 환경변수로 주입
-from fastapi import FastAPI, Query, HTTPException       #앱 인스턴스 생성, 쿼리 파라미터 기본값/검증 선언, 401/400 같은 에러 응답 던질 때
+import os
+import uuid
+from typing import Optional, List, Any
+from datetime import datetime, date
+from contextlib import asynccontextmanager
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import uuid                                     # departments.dept_id 같은 UUID 생성이 필요할 때 사용.               
-from pydantic import BaseModel                  # 요청/응답 스키마 정의(검증·직렬화).
-from sqlalchemy import text,create_engine       # raw SQL 실행 시 사용, PostgreSQL 연결 풀 생성
+from pydantic import BaseModel, Field
+from sqlalchemy import create_engine, text
 
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+from cafeteria_crawl_menu import main as crawl_menu
 
-# -------- docker 환경 변수 로딩 --------
+# =========================
+# 환경 변수 / DB
+# =========================
 load_dotenv()
+
 PGHOST = os.getenv("PGHOST", "localhost")
 PGPORT = os.getenv("PGPORT", "5433")
 PGDATABASE = os.getenv("PGDATABASE", "chatbot")
@@ -20,190 +28,188 @@ PGPASSWORD = os.getenv("PGPASSWORD", "")
 DATABASE_URL = f"postgresql+psycopg2://{PGUSER}:{PGPASSWORD}@{PGHOST}:{PGPORT}/{PGDATABASE}"
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
+# =========================
+# 공용 DB 헬퍼
+# =========================
+def fetch_all(sql: str, params: dict | None = None) -> list[dict]:
+    with engine.connect() as conn:
+        return conn.execute(text(sql), params or {}).mappings().all()
 
-app = FastAPI(title="Cafeteria API", version="0.1.0")
+def fetch_one(sql: str, params: dict | None = None) -> dict | None:
+    with engine.connect() as conn:
+        row = conn.execute(text(sql), params or {}).mappings().first()
+        return row
+
+# =========================
+# FastAPI 설정
+# =========================
+scheduler = BackgroundScheduler()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("🚀 서버 시작")
+    try:
+        crawl_menu()
+    except Exception as e:
+        print("❌ 크롤링 실패:", e)
+
+    scheduler.add_job(crawl_menu, IntervalTrigger(days=3), id="cafeteria", replace_existing=True)
+    scheduler.start()
+    yield
+    scheduler.shutdown()
+
+app = FastAPI(title="Campus API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in os.getenv("ALLOW_ORIGINS", "*").split(",")],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# =========================
+# 자동 테이블 GET API
+# =========================
+AUTO_TABLES = [
+    "users",
+    "subject",
+    "books",
+    "departments",
+    "library_rooms",
+    "library_loans",
+    "library_seat_status",
+    "kb_chunks",
+    "kb_documents",
+    "chat_sessions",
+    "chat_messages",
+    "cafeterias",
+    "academic_events",
+    "faqs",
+    "faq_feedback",
+    "notification_logs",
+    "notification_subscriptions",
+    "class_update",
+    "cafeterias_menus",
+]
+
+def register_table_endpoint(table: str):
+    @app.get(f"/{table}")
+    def list_table( _table: str = table):
+        return fetch_all(
+            f"SELECT * FROM {_table}",
+        )
+
+for t in AUTO_TABLES:
+    register_table_endpoint(t)
 
 
-class Cafeteria(BaseModel):
-    cafe_id: str
-    name: str
-    location: str | None = None
-
-class MenuOut(BaseModel):
-    menu_id: str
-    cafe_name: str
-    date: date
-    meal_type: str
-    item_name: str
-    price: int | None = None
-
-@app.get("/cafeterias", response_model=List[Cafeteria])
-def list_cafeterias(q: Optional[str] = None):
-    sql = "SELECT cafe_id::text, name, location FROM cafeterias"
-    params = {}
-    if q:
-        sql += " WHERE name ILIKE :q"
-        params["q"] = f"%{q}%"
-    sql += " ORDER BY name"
-
-    with engine.connect() as conn:
-        rows = conn.execute(text(sql), params).all()
-
-    return [{"cafe_id": r[0], "name": r[1], "location": r[2]} for r in rows]
-
-@app.get("/menus", response_model=List[MenuOut])
-def list_menus(
-    date_: Optional[date] = Query(None, alias="date"),
-    cafe: Optional[str] = None,
-    limit: int = 100
-):
-    sql = """
-    SELECT m.menu_id::text, c.name, m.date, m.meal_type, m.item_name, m.price
-    FROM cafeterias_menus m
-    JOIN cafeterias c ON c.cafe_id = m.cafe_id
-    WHERE 1=1
-    """
-    params = {}
-    if date_:
-        sql += " AND m.date = :d"
-        params["d"] = date_
-    if cafe:
-        sql += " AND c.name ILIKE :cafe"
-        params["cafe"] = f"%{cafe}%"
-    sql += " ORDER BY m.date DESC, m.meal_type, m.item_name LIMIT :lim"
-    params["lim"] = limit
-
-    with engine.connect() as conn:
-        rows = conn.execute(text(sql), params).all()
-
-    return [
-        {
-            "menu_id": r[0],
-            "cafe_name": r[1],
-            "date": r[2],
-            "meal_type": r[3],
-            "item_name": r[4],
-            "price": r[5],
-        } for r in rows
-    ]
-
-# --- (옵션) 업서트 예시: 크롤러/관리화면에서 사용 ---
-class MenuIn(BaseModel):
-    cafe_name: str
-    date: date
-    meal_type: str
-    item_name: str
-    price: int | None = None
-
-@app.post("/menus", response_model=MenuOut, status_code=201)
-def upsert_menu(body: MenuIn):
-    with engine.begin() as conn:
-        # 식당 ID 확보(없으면 생성)
-        row = conn.execute(text("SELECT cafe_id FROM cafeterias WHERE name=:n"),
-                           {"n": body.cafe_name}).fetchone()
-        if row:
-            cafe_id = row[0]
-
-        # 최종 값 반환
-        r = conn.execute(text("""
-        SELECT m.menu_id::text, c.name, m.date, m.meal_type, m.item_name, m.price
-        FROM cafeterias_menus m
-        JOIN cafeterias c ON c.cafe_id = m.cafe_id
-        WHERE m.cafe_id=:cid AND m.date=:d AND m.meal_type=:m AND m.item_name=:i
-        """), {"cid": cafe_id, "d": body.date, "m": body.meal_type, "i": body.item_name}).one()
-
-    return {"menu_id": r[0], "cafe_name": r[1], "date": r[2],
-            "meal_type": r[3], "item_name": r[4], "price": r[5]}
+@app.get("/subject/filter")
+def subject_filter():
+    return fetch_all("""
+        SELECT *
+        FROM subject
+        WHERE dept IN ('컴퓨터공학과', '교양과정부')
+        ORDER BY dept, grade, code
+    """)
 
 
+# =========================
+# Pydantic 모델 (특수 API용)
+# =========================
 
-
-# --- 회원가입 (users 테이블 + enroll_status/grade 반영) ---
-# 요청/응답 모델
-class SignupIn(BaseModel):              #회원가입 입력 데이터터
+class SignupIn(BaseModel):
     name: str
     studentId: str
     email: str
     password: str
     major: str
     phone: str
-    userType: str                 # 'student' | 'professor'
-    grade: Optional[int] = None   # 학생이면 1~6, 아니면 null
-    enrollmentStatus: Optional[str] = None  # 학생이면 값, 아니면 null
+    userType: str
+    grade: Optional[int] = None
+    enrollmentStatus: Optional[str] = None
 
-class SignupOut(BaseModel):         #회원가입 db에 저장된 데이터
+class SignupOut(BaseModel):
     ok: bool
     userId: str
     name: str
     email: str
     role: str
     deptName: str
-    phone: str | None = None
-    grade: Optional[int] = None
-    enrollmentStatus: Optional[str] = None
-    createdAt: date
+    phone: Optional[str]
+    grade: Optional[int]
+    enrollmentStatus: Optional[str]
+    createdAt: datetime
 
-def get_or_create_dept(conn, dept_name: str) -> str:
+class LoginIn(BaseModel):
+    studentId: str
+    password: str
+
+class LoginOut(BaseModel):
+    ok: bool
+    userId: str
+    name: str
+    email: str
+    role: str
+    deptName: str
+    phone: Optional[str]
+    grade: Optional[int]
+    enrollmentStatus: Optional[str]
+    createdAt: datetime
+
+
+
+# =========================
+# 인증
+# =========================
+def get_or_create_dept(conn, name: str) -> str:
     row = conn.execute(
-        text("SELECT dept_id::text FROM departments WHERE name = :n LIMIT 1"),
-        {"n": dept_name},
+        text("SELECT dept_id::text FROM departments WHERE name=:n"),
+        {"n": name},
     ).fetchone()
     if row:
         return row[0]
-    new_id = str(uuid.uuid4())
+
+    did = str(uuid.uuid4())
     conn.execute(
-        text("INSERT INTO departments (dept_id, name) VALUES (:id, :n)"),
-        {"id": new_id, "n": dept_name},
+        text("INSERT INTO departments (dept_id, name) VALUES (:i, :n)"),
+        {"i": did, "n": name},
     )
-    return new_id
+    return did
 
-@app.post("/auth/signup", response_model=SignupOut, status_code=201)
+@app.post("/auth/signup", response_model=SignupOut)
 def signup(body: SignupIn):
-    role = body.userType.lower().strip()
+    role = body.userType.lower()
     if role not in ("student", "professor"):
-        raise HTTPException(400, "userType must be 'student' or 'professor'")
-
-    # 학생만 grade/enroll_status 반영, 교수면 NULL로
-    grade = body.grade if role == "student" else None
-    enroll_status = body.enrollmentStatus if role == "student" else None
+        raise HTTPException(400, "Invalid role")
 
     with engine.begin() as conn:
         dept_id = get_or_create_dept(conn, body.major)
 
-        # users: user_id=학번, 나머지 매핑
         conn.execute(text("""
             INSERT INTO users
-              (user_id, name, email, password, phone, role, grade, enroll_status, dept_id, created_at)
+            (user_id, name, email, password, phone, role, grade, enroll_status, dept_id, created_at)
             VALUES
-              (:user_id, :name, :email, :password, :phone, :role, :grade, :enroll_status, :dept_id, NOW())
+            (:id, :n, :e, :p, :ph, :r, :g, :es, :d, NOW() AT TIME ZONE 'Asia/Seoul')
         """), {
-            "user_id": body.studentId,
-            "name": body.name,
-            "email": body.email,
-            "password": body.password,      # 테스트용: 평문 저장(운영 전 해시 필요)
-            "phone": body.phone,
-            "role": role,
-            "grade": grade,
-            "enroll_status": enroll_status,
-            "dept_id": dept_id,
+            "id": body.studentId,
+            "n": body.name,
+            "e": body.email,
+            "p": body.password,
+            "ph": body.phone,
+            "r": role,
+            "g": body.grade if role == "student" else None,
+            "es": body.enrollmentStatus if role == "student" else None,
+            "d": dept_id,
         })
 
         row = conn.execute(text("""
-            SELECT u.user_id, u.name, u.email, u.role, u.phone, u.grade, u.enroll_status,
-                   d.name AS dept_name, u.created_at
+            SELECT u.user_id, u.name, u.email, u.role, u.phone,
+                   u.grade, u.enroll_status, d.name, u.created_at
             FROM users u
             JOIN departments d ON d.dept_id = u.dept_id
-            WHERE u.user_id = :uid
-        """), {"uid": body.studentId}).one()
+            WHERE u.user_id = :id
+        """), {"id": body.studentId}).one()
 
     return {
         "ok": True,
@@ -218,51 +224,79 @@ def signup(body: SignupIn):
         "createdAt": row[8],
     }
 
-
-# --- 로그인: 학번(userId) + 비밀번호(평문 비교, 테스트용) ---
-
-class LoginIn(BaseModel):
-    studentId: str
-    password: str
-
-class LoginOut(BaseModel):
-    ok: bool
-    userId: str
-    name: str
-    email: str
-    role: str
-    deptName: str
-    phone: Optional[str] = None
-    grade: Optional[int] = None
-    enrollmentStatus: Optional[str] = None
-    createdAt: date
-
 @app.post("/auth/login", response_model=LoginOut)
 def login(body: LoginIn):
-    with engine.connect() as conn:
-        row = conn.execute(text("""
-            SELECT u.user_id, u.name, u.email, u.password, u.role, u.phone,
-                   u.grade, u.enroll_status, d.name AS dept_name, u.created_at
-            FROM users u
-            JOIN departments d ON d.dept_id = u.dept_id
-            WHERE u.user_id = :sid
-            LIMIT 1
-        """), {"sid": body.studentId}).fetchone()
+    row = fetch_one("""
+        SELECT u.user_id, u.name, u.email, u.password, u.role, u.phone,
+               u.grade, u.enroll_status, d.name, u.created_at
+        FROM users u
+        JOIN departments d ON d.dept_id = u.dept_id
+        WHERE u.user_id = :id
+    """, {"id": body.studentId})
 
-    # 존재 X 또는 비밀번호 불일치 (테스트: 평문 비교)
-    if not row or row[3] != body.password:
-        raise HTTPException(status_code=401, detail="invalid credentials")
+    if not row or row["password"] != body.password:
+        raise HTTPException(401, "Invalid credentials")
 
     return {
         "ok": True,
-        "userId": row[0],
-        "name": row[1],
-        "email": row[2],
-        "role": row[4],
-        "phone": row[5],
-        "grade": row[6],
-        "enrollmentStatus": row[7],
-        "deptName": row[8],
-        "createdAt": row[9],
+        "userId": row["user_id"],
+        "name": row["name"],
+        "email": row["email"],
+        "role": row["role"],
+        "phone": row["phone"],
+        "grade": row["grade"],
+        "enrollmentStatus": row["enroll_status"],
+        "deptName": row["name_1"] if "name_1" in row else row["name"],
+        "createdAt": row["created_at"],
     }
 
+class ChatIn(BaseModel):
+    user_id: str
+    message: str = Field(..., alias="text")
+
+@app.post("/chat")
+def create_chat(body: ChatIn):
+    try:
+        with engine.begin() as conn:
+            # 1️⃣ 기존 세션 조회
+            row = conn.execute(text("""
+                SELECT session_id
+                FROM chat_sessions
+                WHERE user_id = :uid
+                ORDER BY created_at DESC
+                LIMIT 1
+            """), {"uid": body.user_id}).fetchone()
+
+            if row is not None:
+                session_id = row[0]
+            else:
+                # 2️⃣ 세션 없으면 새로 생성
+                session_id = str(uuid.uuid4())
+                conn.execute(text("""
+                    INSERT INTO chat_sessions
+                    (session_id, user_id, title, created_at)
+                    VALUES
+                    (:sid, :uid, :title, NOW() AT TIME ZONE 'Asia/Seoul')
+                """), {
+                    "sid": session_id,
+                    "uid": body.user_id,   # 학번 문자열
+                    "title": body.message,
+                })
+
+            # 3️⃣ 메시지 저장
+            conn.execute(text("""
+                INSERT INTO chat_messages
+                (message_id, session_id, content, created_at)
+                VALUES
+                (:mid, :sid, :content, NOW() AT TIME ZONE 'Asia/Seoul')
+            """), {
+                "mid": str(uuid.uuid4()),
+                "sid": session_id,
+                "content": body.message,
+            })
+
+        return {"ok": True, "session_id": session_id}
+
+    except Exception as e:
+        print("🔥 CHAT ERROR:", e)
+        raise HTTPException(status_code=500, detail=str(e))
