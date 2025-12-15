@@ -5,13 +5,14 @@ from bs4 import BeautifulSoup  # type: ignore
 from dotenv import load_dotenv
 load_dotenv()
 
-DB = dict(       #DB 연결 설정
-    host=os.getenv("PGHOST", "localhost"),
-    port=int(os.getenv("PGPORT", "5433")),
-    dbname=os.getenv("PGDATABASE", "chatbot"),
-    user=os.getenv("PGUSER", "postgres"),
-    password=os.getenv("PGPASSWORD", "postgres"),
-)
+# DB 연결 설정
+DB = {
+    "host": os.getenv("PGHOST", "localhost"),
+    "port": int(os.getenv("PGPORT", "5433")),
+    "database": os.getenv("PGDATABASE", "chatbot"),  # dbname 대신 database 사용
+    "user": os.getenv("PGUSER", "postgres"),
+    "password": os.getenv("PGPASSWORD", "postgres"),
+}
 
 URL = "https://www.mmu.ac.kr/main/contents/todayMenu1"  # 학교 식당 url 주소소
 
@@ -89,15 +90,15 @@ def save_rows(rows):                                                #db 연동�
             cur.execute("DELETE FROM cafeterias_menus WHERE cafe_id = %s::uuid", (str(CAFE_ID),))           #새로운 메뉴를 넣을때는 기존에 있던 메뉴 데이터 삭제제
             
             for row in rows:                                                                                #rows데이터의 인덱스 하니씩 꺼내오기
-                for d, meal, item in parse_row(row):                                                        # 꺼내온 데이터를 파싱싱
-                    cur.execute("""
-                        INSERT INTO cafeterias_menus(menu_id, cafe_id, date, meal_type, item_name, price) VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s)
-                        ON CONFLICT (cafe_id, date, meal_type, item_name) DO UPDATE SET price = EXCLUDED.price
-                    """, (str(uuid.uuid4()), str(CAFE_ID), d, meal, item, 5500))   # db insert into 명령
+                parsed = parse_row(row)                                                                    # 꺼내온 데이터를 파싱
+                if parsed:                                                                                 # 파싱 결과가 있으면
+                    for d, meal, item in parsed:                                                           # 각 메뉴 항목 삽입
+                        cur.execute("""
+                            INSERT INTO cafeterias_menus(menu_id, cafe_id, date, meal_type, item_name, price) VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s)
+                            ON CONFLICT (cafe_id, date, meal_type, item_name) DO UPDATE SET price = EXCLUDED.price
+                        """, (str(uuid.uuid4()), str(CAFE_ID), d, meal, item, 5500))   # db insert into 명령
     except psycopg2.OperationalError as e:                              # db 연결 실패 시 예외 처리
-        print("❌ connection failed:", e)                              
-    finally:
-        conn.close()
+        print("❌ connection failed:", e)
 
 def main():
     i = 0
@@ -109,13 +110,5 @@ def main():
 
     print("완료")
 
-
-
 if __name__ == '__main__' : 
     main();
-
-
-
-
-
-
